@@ -2,6 +2,7 @@ import asyncio
 import ssl
 import os
 import socket
+import threading
 from urllib.parse import urlparse
 from typing import cast
 import tornado.websocket
@@ -83,46 +84,66 @@ class ProxiedWebSocketClientConnection(WebSocketClientConnection):
                 return _stream
             self.tcp_client.connect = _patched_connect
 
+
+
+
 def _build_tunnel_sync(resolver):
-    import socket
-    import ssl
+    result = {}
+    exception = {}
 
-    # Plain TCP to proxy (no SSL to proxy)
-    raw_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    raw_sock.setblocking(True)
-    raw_sock.settimeout(30)
-    raw_sock.connect((resolver.proxy_host, resolver.proxy_port))
+    def _run():
+        try:
+            # Plain TCP to proxy
+            raw_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            raw_sock.setblocking(True)
+            raw_sock.settimeout(30)
+            raw_sock.connect((resolver.proxy_host, resolver.proxy_port))
 
-    # HTTP CONNECT
-    connect_req = (
-        f"CONNECT {resolver.target_host}:{resolver.target_port} HTTP/1.1\r\n"
-        f"Host: {resolver.target_host}:{resolver.target_port}\r\n"
-        f"Proxy-Connection: keep-alive\r\n\r\n"
-    )
-    raw_sock.sendall(connect_req.encode())
+            # HTTP CONNECT
+            connect_req = (
+                f"CONNECT {resolver.target_host}:{resolver.target_port} HTTP/1.1\r\n"
+                f"Host: {resolver.target_host}:{resolver.target_port}\r\n"
+                f"Proxy-Connection: keep-alive\r\n\r\n"
+            )
+            raw_sock.sendall(connect_req.encode())
 
-    # Read CONNECT response
-    response = b""
-    while b"\r\n\r\n" not in response:
-        chunk = raw_sock.recv(4096)
-        if not chunk:
-            raise Exception("Proxy closed connection during CONNECT")
-        response += chunk
+            # Read CONNECT response
+            response = b""
+            while b"\r\n\r\n" not in response:
+                chunk = raw_sock.recv(4096)
+                if not chunk:
+                    raise Exception("Proxy closed connection during CONNECT")
+                response += chunk
 
-    if b"200" not in response:
-        raw_sock.close()
-        raise Exception(f"Proxy CONNECT failed: {response}")
+            if b"200" not in response:
+                raw_sock.close()
+                raise Exception(f"Proxy CONNECT failed: {response}")
 
-    # SSL directly to GCP through tunnel
-    ssl_ctx = ssl.create_default_context()
-    ssl_sock = ssl_ctx.wrap_socket(
-        raw_sock,
-        server_hostname=resolver.target_host,
-        do_handshake_on_connect=True
-    )
-    ssl_sock.setblocking(False)
-    resolver._ssl_sock = ssl_sock
+            # SSL directly to GCP through tunnel
+            ssl_ctx = ssl.create_default_context()
+            ssl_sock = ssl_ctx.wrap_socket(
+                raw_sock,
+                server_hostname=resolver.target_host,
+                do_handshake_on_connect=True
+            )
+            ssl_sock.setblocking(False)
+            result['sock'] = ssl_sock
 
+        except Exception as e:
+            exception['error'] = e
+
+    # Run in a dedicated thread — completely isolated from asyncio event loop
+    t = threading.Thread(target=_run, daemon=True)
+    t.start()
+    t.join(timeout=35)
+
+    if exception:
+        raise exception['error']
+    if 'sock' not in result:
+        raise Exception("Tunnel build timed out")
+
+    resolver._ssl_sock = result['sock']
+    
 from tornado.httpclient import HTTPRequest
 from tornado import httputil
 
@@ -146,13 +167,11 @@ async def _proxy_ws_connect(url, *args, **kwargs):
         target_port=parsed_target.port or 443,
     )
 
-    # Call sync directly — no executor, no asyncio interference
+    # Dedicated thread — fully isolated from asyncio
     _build_tunnel_sync(resolver)
 
-    # IOStream wraps the clean non-blocking ssl socket
     resolver._iostream = IOStream(resolver._ssl_sock)
 
-    # Rewrite wss → ws, Tornado skips SSL since tunnel already has it
     if isinstance(url, str):
         url = url.replace("wss://", "ws://", 1)
         request = HTTPRequest(url)

@@ -86,14 +86,14 @@ class ProxiedWebSocketClientConnection(WebSocketClientConnection):
 def _build_tunnel_sync(resolver):
     import socket
     import ssl
-    import time
 
-    # Step 1 — raw TCP to proxy, fully blocking
+    # Plain TCP to proxy (no SSL to proxy)
     raw_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    raw_sock.settimeout(30)  # 30s timeout
+    raw_sock.setblocking(True)
+    raw_sock.settimeout(30)
     raw_sock.connect((resolver.proxy_host, resolver.proxy_port))
 
-    # Step 2 — HTTP CONNECT
+    # HTTP CONNECT
     connect_req = (
         f"CONNECT {resolver.target_host}:{resolver.target_port} HTTP/1.1\r\n"
         f"Host: {resolver.target_host}:{resolver.target_port}\r\n"
@@ -101,7 +101,7 @@ def _build_tunnel_sync(resolver):
     )
     raw_sock.sendall(connect_req.encode())
 
-    # Step 3 — Read CONNECT response
+    # Read CONNECT response
     response = b""
     while b"\r\n\r\n" not in response:
         chunk = raw_sock.recv(4096)
@@ -113,34 +113,13 @@ def _build_tunnel_sync(resolver):
         raw_sock.close()
         raise Exception(f"Proxy CONNECT failed: {response}")
 
-    # Step 4 — SSL handshake, explicitly blocking with timeout
+    # SSL directly to GCP through tunnel
     ssl_ctx = ssl.create_default_context()
-    ssl_ctx.check_hostname = True
-    ssl_ctx.verify_mode = ssl.CERT_REQUIRED
-
-    # KEY: keep socket blocking during handshake
-    raw_sock.setblocking(True)
-    raw_sock.settimeout(30)
-
     ssl_sock = ssl_ctx.wrap_socket(
         raw_sock,
         server_hostname=resolver.target_host,
-        do_handshake_on_connect=False  # we control handshake manually
+        do_handshake_on_connect=True
     )
-
-    # Step 5 — Manual handshake loop with retry on WANT_READ/WANT_WRITE
-    while True:
-        try:
-            ssl_sock.do_handshake()
-            break
-        except ssl.SSLWantReadError:
-            time.sleep(0.05)
-            continue
-        except ssl.SSLWantWriteError:
-            time.sleep(0.05)
-            continue
-
-    # Step 6 — Now switch to non-blocking for Tornado
     ssl_sock.setblocking(False)
     resolver._ssl_sock = ssl_sock
 

@@ -115,6 +115,9 @@ def _build_tunnel_sync(resolver):
     resolver._ssl_sock = ssl_sock  # store for iostream creation on main thread
 
 
+from tornado.httpclient import HTTPRequest
+from tornado import httputil
+
 async def _proxy_ws_connect(url, *args, **kwargs):
     url_str = url.url if hasattr(url, "url") else url
 
@@ -135,21 +138,27 @@ async def _proxy_ws_connect(url, *args, **kwargs):
         target_port=parsed_target.port or 443,
     )
 
-    # Build tunnel in thread — completely avoids asyncio transport conflicts
     loop = asyncio.get_event_loop()
     await loop.run_in_executor(None, _build_tunnel_sync, resolver)
-
-    # IOStream must be created on the main thread after executor returns
     resolver._iostream = IOStream(resolver._ssl_sock)
 
-    # Rewrite wss → ws so Tornado skips SSL (already done in tunnel)
+    # Rewrite wss → ws
     if isinstance(url, str):
         url = url.replace("wss://", "ws://", 1)
+        request = HTTPRequest(url)
     elif hasattr(url, "url"):
         url.url = url.url.replace("wss://", "ws://", 1)
+        request = url
 
-    from tornado.httpclient import HTTPRequest
-    request = url if isinstance(url, HTTPRequest) else HTTPRequest(url)
+    # ↓ KEY FIX: ensure headers is HTTPHeaders, not dict
+    request.headers = httputil.HTTPHeaders(request.headers)
+
+    # Mirror exactly what websocket_connect() does before constructing conn
+    from tornado.httpclient import _RequestProxy
+    request = cast(
+        HTTPRequest,
+        _RequestProxy(request, HTTPRequest._DEFAULTS)
+    )
 
     conn = ProxiedWebSocketClientConnection(
         request,

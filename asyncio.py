@@ -3,7 +3,7 @@ import ssl
 import os
 import socket
 from urllib.parse import urlparse
-
+from typing import cast
 import tornado.websocket
 from tornado.websocket import WebSocketClientConnection
 from tornado.netutil import Resolver

@@ -97,74 +97,68 @@ class ProxiedWebSocketClientConnection(WebSocketClientConnection):
 def _build_tunnel_sync(resolver):
     import socket
     import ssl
-    import traceback
+    import threading
 
-    try:
-        raw_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        raw_sock.setblocking(True)
-        raw_sock.settimeout(30)
-        raw_sock.connect((resolver.proxy_host, resolver.proxy_port))
-        print(f"[tunnel] connected to proxy")
+    result = {}
+    exception = {}
 
-        connect_req = (
-            f"CONNECT {resolver.target_host}:{resolver.target_port} HTTP/1.1\r\n"
-            f"Host: {resolver.target_host}:{resolver.target_port}\r\n"
-            f"Proxy-Connection: keep-alive\r\n\r\n"
-        )
-        raw_sock.sendall(connect_req.encode())
-        print(f"[tunnel] sent CONNECT")
+    def _run():
+        try:
+            raw_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            raw_sock.setblocking(True)
+            raw_sock.settimeout(30)
+            raw_sock.connect((resolver.proxy_host, resolver.proxy_port))
 
-        response = b""
-        while b"\r\n\r\n" not in response:
-            chunk = raw_sock.recv(4096)
-            if not chunk:
-                raise Exception("Proxy closed connection")
-            response += chunk
-        print(f"[tunnel] CONNECT response: {response}")
+            connect_req = (
+                f"CONNECT {resolver.target_host}:{resolver.target_port} HTTP/1.1\r\n"
+                f"Host: {resolver.target_host}:{resolver.target_port}\r\n"
+                f"Proxy-Connection: keep-alive\r\n\r\n"
+            )
+            raw_sock.sendall(connect_req.encode())
 
-        if b"200" not in response:
-            raise Exception(f"Proxy CONNECT failed: {response}")
+            response = b""
+            while b"\r\n\r\n" not in response:
+                chunk = raw_sock.recv(4096)
+                if not chunk:
+                    raise Exception("Proxy closed connection")
+                response += chunk
 
-        print(f"[tunnel] tunnel established, starting SSL")
-        print(f"[tunnel] socket state before SSL: blocking={raw_sock.getblocking()}, timeout={raw_sock.gettimeout()}")
+            if b"200" not in response:
+                raw_sock.close()
+                raise Exception(f"Proxy CONNECT failed: {response}")
 
-        ssl_ctx = ssl.create_default_context()
-        print(f"[tunnel] ssl_ctx created")
+            ssl_ctx = ssl.create_default_context()
 
-        ssl_sock = ssl_ctx.wrap_socket(
-            raw_sock,
-            server_hostname=resolver.target_host,
-            do_handshake_on_connect=False  # manual handshake
-        )
-        print(f"[tunnel] socket wrapped")
+            # Wrap with do_handshake_on_connect=False — SSLIOStream requires this
+            ssl_sock = ssl_ctx.wrap_socket(
+                raw_sock,
+                server_hostname=resolver.target_host,
+                do_handshake_on_connect=False
+            )
 
-        # Manual handshake with full visibility
-        import select
-        for attempt in range(100):
-            try:
-                print(f"[tunnel] handshake attempt {attempt}")
-                ssl_sock.do_handshake()
-                print(f"[tunnel] handshake complete!")
-                break
-            except ssl.SSLWantReadError:
-                print(f"[tunnel] WANT_READ, waiting...")
-                select.select([ssl_sock], [], [], 5)
-            except ssl.SSLWantWriteError:
-                print(f"[tunnel] WANT_WRITE, waiting...")
-                select.select([], [ssl_sock], [], 5)
-            except Exception as e:
-                print(f"[tunnel] handshake error: {type(e).__name__}: {e}")
-                traceback.print_exc()
-                raise
-        
-        ssl_sock.setblocking(False)
-        resolver._ssl_sock = ssl_sock
-        print(f"[tunnel] done, ssl_sock ready")
+            # Complete handshake manually while still in thread
+            ssl_sock.setblocking(True)
+            ssl_sock.settimeout(30)
+            ssl_sock.do_handshake()
 
-    except Exception as e:
-        print(f"[tunnel] FAILED: {type(e).__name__}: {e}")
-        traceback.print_exc()
-        raise    
+            # Switch to non-blocking for Tornado
+            ssl_sock.setblocking(False)
+            result['sock'] = ssl_sock
+
+        except Exception as e:
+            exception['error'] = e
+
+    t = threading.Thread(target=_run, daemon=True)
+    t.start()
+    t.join(timeout=35)
+
+    if exception:
+        raise exception['error']
+    if 'sock' not in result:
+        raise Exception("Tunnel build timed out")
+
+    resolver._ssl_sock = result['sock']
+    
 from tornado.httpclient import HTTPRequest
 from tornado import httputil
 
@@ -190,15 +184,15 @@ async def _proxy_ws_connect(url, *args, **kwargs):
 
     _build_tunnel_sync(resolver)
 
-    # SSLIOStream — tells Tornado SSL is in place, skips handshake
+    from tornado.iostream import SSLIOStream
     ssl_ctx = ssl.create_default_context()
+    
     resolver._iostream = SSLIOStream(
-        resolver._ssl_sock,
-        ssl_options=ssl_ctx,
-        server_hostname=resolver.target_host,
+        resolver._ssl_sock,    # already wrapped with do_handshake_on_connect=False
+        ssl_options=ssl_ctx,   # pass same ctx
     )
-    resolver._iostream._ssl_accepting = False
-
+    resolver._iostream._ssl_accepting = False      # handshake already done
+    resolver._iostream._server_hostname = resolver.target_host
     # Keep wss:// — Tornado expects SSL stream for wss
     if isinstance(url, str):
         request = HTTPRequest(url)

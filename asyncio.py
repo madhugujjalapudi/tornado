@@ -11,26 +11,35 @@ from tornado.websocket import WebSocketClientConnection
 
 _original_ws_connect = tornado.websocket.websocket_connect
 
+class ProxiedWebSocketClientConnection(WebSocketClientConnection):
 
+    def __init__(self, request, resolver=None, **kwargs):
+        # resolver here is our ProxyTunnelResolver
+        self._proxy_resolver = resolver
+        super().__init__(request, resolver=resolver, **kwargs)
+
+        if resolver and hasattr(resolver, '_iostream') and resolver._iostream:
+            # Patch tcp_client.connect to return our pre-built stream
+            _stream = resolver._iostream
+            async def _patched_connect(host, port, *a, **kw):
+                return _stream
+            self.tcp_client.connect = _patched_connect
 class ProxyTunnelResolver(Resolver):
-    """
-    Custom Tornado Resolver that tunnels through an HTTP CONNECT proxy.
-    Injected into TCPClient inside WebSocketClientConnection.
-    """
 
     def initialize(self, proxy_host, proxy_port, target_host, target_port):
         self.proxy_host = proxy_host
         self.proxy_port = proxy_port
         self.target_host = target_host
         self.target_port = target_port
+        self._iostream = None  # store the tunneled stream here
 
     async def resolve(self, host, port, family=socket.AF_UNSPEC):
-        # Step 1 — TCP connect to proxy via asyncio
+        # TCP connect to proxy
         reader, writer = await asyncio.open_connection(
             self.proxy_host, self.proxy_port
         )
 
-        # Step 2 — HTTP CONNECT tunnel request
+        # HTTP CONNECT
         connect_req = (
             f"CONNECT {self.target_host}:{self.target_port} HTTP/1.1\r\n"
             f"Host: {self.target_host}:{self.target_port}\r\n"
@@ -39,38 +48,38 @@ class ProxyTunnelResolver(Resolver):
         writer.write(connect_req.encode())
         await writer.drain()
 
-        # Step 3 — Read proxy response
         response = b""
         while b"\r\n\r\n" not in response:
             chunk = await reader.read(4096)
             if not chunk:
-                raise Exception("Proxy closed connection before CONNECT response")
+                raise Exception("Proxy closed connection")
             response += chunk
 
         if b"200" not in response:
             writer.close()
             raise Exception(f"Proxy CONNECT failed: {response}")
 
-        # Step 4 — SSL upgrade using asyncio loop.start_tls (safe on Windows)
+        # SSL upgrade
         ssl_ctx = ssl.create_default_context()
         transport = writer.transport
         protocol = transport.get_protocol()
         loop = asyncio.get_event_loop()
 
         ssl_transport = await loop.start_tls(
-            transport,
-            protocol,
-            ssl_ctx,
+            transport, protocol, ssl_ctx,
             server_side=False,
             server_hostname=self.target_host,
         )
 
-        # Step 5 — Return the tunneled socket in Tornado's expected format
-        # resolve() must return a list of (family, address) tuples
-        # We store the ssl_transport so TCPClient can grab it
-        self._ssl_transport = ssl_transport
-        tunneled_sock = ssl_transport.get_extra_info("socket")
-        return [(socket.AF_INET, tunneled_sock.getpeername())]
+        # Wrap in a Tornado IOStream so TCPClient can use it directly
+        raw_sock = ssl_transport.get_extra_info("socket")
+        
+        from tornado.iostream import SSLIOStream
+        import tornado.ioloop
+        self._iostream = SSLIOStream(raw_sock)
+
+        # Return dummy address — TCPClient will use our iostream instead
+        return [(socket.AF_INET, ("127.0.0.1", self.target_port))]
 
 
 async def _proxy_ws_connect(url, *args, **kwargs):

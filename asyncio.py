@@ -86,15 +86,32 @@ async def _proxy_ws_connect(url, *args, **kwargs):
     parsed_proxy = urlparse(proxy_url)
     parsed_target = urlparse(url_str)
 
+    # Build tunnel + SSL first
     resolver = ProxyTunnelResolver(
         proxy_host=parsed_proxy.hostname,
         proxy_port=parsed_proxy.port,
         target_host=parsed_target.hostname,
         target_port=parsed_target.port or 443,
     )
+    # Pre-build the tunnel so iostream is ready before TCPClient needs it
+    await resolver.resolve(parsed_target.hostname, parsed_target.port or 443)
 
-    # Pass our resolver into websocket_connect — it flows into TCPClient
-    return await _original_ws_connect(url, *args, resolver=resolver, **kwargs)
+    # Rewrite wss → ws so Tornado skips its own SSL
+    if isinstance(url, str):
+        url = url.replace("wss://", "ws://", 1)
+    elif hasattr(url, "url"):
+        url.url = url.url.replace("wss://", "ws://", 1)
+
+    # Use our subclass which injects the pre-built stream
+    from tornado.httpclient import HTTPRequest, _RequestProxy
+    request = url if isinstance(url, HTTPRequest) else HTTPRequest(url)
+    
+    conn = ProxiedWebSocketClientConnection(
+        request,
+        resolver=resolver,
+        **kwargs
+    )
+    return await conn.connect_future
 
 
 def _patched_ws_connect(url, *args, **kwargs):

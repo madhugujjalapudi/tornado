@@ -73,11 +73,14 @@ class ProxyTunnelResolver(Resolver):
 
         # Wrap in a Tornado IOStream so TCPClient can use it directly
         raw_sock = ssl_transport.get_extra_info("socket")
+        loop.remove_reader(raw_sock.fileno())
+        loop.remove_writer(raw_sock.fileno())
+        ssl_transport.abort()    
+        raw_sock.setblocking(False)
         
-        from tornado.iostream import SSLIOStream
+        from tornado.iostream import IOStream
         import tornado.ioloop
-        self._iostream = SSLIOStream(raw_sock)
-
+        self._iostream = IOStream(raw_sock)
         # Return dummy address — TCPClient will use our iostream instead
         return [(socket.AF_INET, ("127.0.0.1", self.target_port))]
 

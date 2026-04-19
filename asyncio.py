@@ -199,3 +199,23 @@ def _patched_ws_connect(url, *args, **kwargs):
 
 
 tornado.websocket.websocket_connect = _patched_ws_connect
+
+
+# python -c "
+# import socket, ssl
+# ctx = ssl.create_default_context()
+# ctx.check_hostname = False
+# ctx.verify_mode = ssl.CERT_NONE
+# s = socket.create_connection(('YOUR_PROXY_HOST', YOUR_PROXY_PORT))
+# ss = ctx.wrap_socket(s)
+
+# # Now CONNECT
+# ss.sendall(b'CONNECT <project>-dot-us-central1.kernels.googleusercontent.com:443 HTTP/1.1\r\nHost: <project>-dot-us-central1.kernels.googleusercontent.com:443\r\n\r\n')
+# print(ss.recv(4096))
+
+# ctx2 = ssl.create_default_context()
+# ctx2.check_hostname = False
+# ctx2.verify_mode = ssl.CERT_NONE
+# ss2 = ctx2.wrap_socket(ss.unwrap(), server_hostname='<project>-dot-us-central1.kernels.googleusercontent.com')
+# print('Issuer:', ss2.getpeercert(binary_form=False))
+# "

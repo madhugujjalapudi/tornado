@@ -77,10 +77,16 @@ class ProxiedWebSocketClientConnection(WebSocketClientConnection):
         self._proxy_resolver = proxy_resolver
         super().__init__(request, **kwargs)
 
-        # Patch tcp_client.connect to return our pre-built stream
         if proxy_resolver and proxy_resolver._iostream:
             _stream = proxy_resolver._iostream
-            async def _patched_connect(host, port, *a, **kw):
+            async def _patched_connect(host, port, af=None,
+                                       ssl_options=None,
+                                       max_buffer_size=None,
+                                       source_ip=None,
+                                       source_port=None,
+                                       timeout=None):
+                # Return pre-built SSLIOStream directly
+                # Tornado calls connect() expecting a stream back
                 return _stream
             self.tcp_client.connect = _patched_connect
 
@@ -181,16 +187,21 @@ async def _proxy_ws_connect(url, *args, **kwargs):
         target_port=parsed_target.port or 443,
     )
 
-    # Dedicated thread — fully isolated from asyncio
     _build_tunnel_sync(resolver)
 
-    resolver._iostream = IOStream(resolver._ssl_sock)
+    # SSLIOStream — tells Tornado SSL is in place, skips handshake
+    ssl_ctx = ssl.create_default_context()
+    resolver._iostream = SSLIOStream(
+        resolver._ssl_sock,
+        ssl_options=ssl_ctx,
+        server_hostname=resolver.target_host,
+    )
+    resolver._iostream._ssl_accepting = False
 
+    # Keep wss:// — Tornado expects SSL stream for wss
     if isinstance(url, str):
-        url = url.replace("wss://", "ws://", 1)
         request = HTTPRequest(url)
-    elif hasattr(url, "url"):
-        url.url = url.url.replace("wss://", "ws://", 1)
+    else:
         request = url
 
     request.headers = httputil.HTTPHeaders(request.headers)
@@ -202,6 +213,7 @@ async def _proxy_ws_connect(url, *args, **kwargs):
         **kwargs
     )
     return await conn.connect_future
+    
 def _patched_ws_connect(url, *args, **kwargs):
     loop = asyncio.get_event_loop()
     return asyncio.ensure_future(

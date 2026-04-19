@@ -10,6 +10,7 @@ from tornado.websocket import WebSocketClientConnection
 from tornado.netutil import Resolver
 from tornado.iostream import IOStream
 from tornado.httpclient import _RequestProxy
+from tornado.iostream import SSLIOStream
 
 _original_ws_connect = tornado.websocket.websocket_connect
 

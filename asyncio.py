@@ -88,62 +88,76 @@ class ProxiedWebSocketClientConnection(WebSocketClientConnection):
 
 
 def _build_tunnel_sync(resolver):
-    result = {}
-    exception = {}
+    import socket
+    import ssl
+    import traceback
 
-    def _run():
-        try:
-            # Plain TCP to proxy
-            raw_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            raw_sock.setblocking(True)
-            raw_sock.settimeout(30)
-            raw_sock.connect((resolver.proxy_host, resolver.proxy_port))
+    try:
+        raw_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        raw_sock.setblocking(True)
+        raw_sock.settimeout(30)
+        raw_sock.connect((resolver.proxy_host, resolver.proxy_port))
+        print(f"[tunnel] connected to proxy")
 
-            # HTTP CONNECT
-            connect_req = (
-                f"CONNECT {resolver.target_host}:{resolver.target_port} HTTP/1.1\r\n"
-                f"Host: {resolver.target_host}:{resolver.target_port}\r\n"
-                f"Proxy-Connection: keep-alive\r\n\r\n"
-            )
-            raw_sock.sendall(connect_req.encode())
+        connect_req = (
+            f"CONNECT {resolver.target_host}:{resolver.target_port} HTTP/1.1\r\n"
+            f"Host: {resolver.target_host}:{resolver.target_port}\r\n"
+            f"Proxy-Connection: keep-alive\r\n\r\n"
+        )
+        raw_sock.sendall(connect_req.encode())
+        print(f"[tunnel] sent CONNECT")
 
-            # Read CONNECT response
-            response = b""
-            while b"\r\n\r\n" not in response:
-                chunk = raw_sock.recv(4096)
-                if not chunk:
-                    raise Exception("Proxy closed connection during CONNECT")
-                response += chunk
+        response = b""
+        while b"\r\n\r\n" not in response:
+            chunk = raw_sock.recv(4096)
+            if not chunk:
+                raise Exception("Proxy closed connection")
+            response += chunk
+        print(f"[tunnel] CONNECT response: {response}")
 
-            if b"200" not in response:
-                raw_sock.close()
-                raise Exception(f"Proxy CONNECT failed: {response}")
+        if b"200" not in response:
+            raise Exception(f"Proxy CONNECT failed: {response}")
 
-            # SSL directly to GCP through tunnel
-            ssl_ctx = ssl.create_default_context()
-            ssl_sock = ssl_ctx.wrap_socket(
-                raw_sock,
-                server_hostname=resolver.target_host,
-                do_handshake_on_connect=True
-            )
-            ssl_sock.setblocking(False)
-            result['sock'] = ssl_sock
+        print(f"[tunnel] tunnel established, starting SSL")
+        print(f"[tunnel] socket state before SSL: blocking={raw_sock.getblocking()}, timeout={raw_sock.gettimeout()}")
 
-        except Exception as e:
-            exception['error'] = e
+        ssl_ctx = ssl.create_default_context()
+        print(f"[tunnel] ssl_ctx created")
 
-    # Run in a dedicated thread — completely isolated from asyncio event loop
-    t = threading.Thread(target=_run, daemon=True)
-    t.start()
-    t.join(timeout=35)
+        ssl_sock = ssl_ctx.wrap_socket(
+            raw_sock,
+            server_hostname=resolver.target_host,
+            do_handshake_on_connect=False  # manual handshake
+        )
+        print(f"[tunnel] socket wrapped")
 
-    if exception:
-        raise exception['error']
-    if 'sock' not in result:
-        raise Exception("Tunnel build timed out")
+        # Manual handshake with full visibility
+        import select
+        for attempt in range(100):
+            try:
+                print(f"[tunnel] handshake attempt {attempt}")
+                ssl_sock.do_handshake()
+                print(f"[tunnel] handshake complete!")
+                break
+            except ssl.SSLWantReadError:
+                print(f"[tunnel] WANT_READ, waiting...")
+                select.select([ssl_sock], [], [], 5)
+            except ssl.SSLWantWriteError:
+                print(f"[tunnel] WANT_WRITE, waiting...")
+                select.select([], [ssl_sock], [], 5)
+            except Exception as e:
+                print(f"[tunnel] handshake error: {type(e).__name__}: {e}")
+                traceback.print_exc()
+                raise
+        
+        ssl_sock.setblocking(False)
+        resolver._ssl_sock = ssl_sock
+        print(f"[tunnel] done, ssl_sock ready")
 
-    resolver._ssl_sock = result['sock']
-    
+    except Exception as e:
+        print(f"[tunnel] FAILED: {type(e).__name__}: {e}")
+        traceback.print_exc()
+        raise    
 from tornado.httpclient import HTTPRequest
 from tornado import httputil
 

@@ -83,10 +83,16 @@ class ProxiedWebSocketClientConnection(WebSocketClientConnection):
             self.tcp_client.connect = _patched_connect
 
 def _build_tunnel_sync(resolver):
-    """Runs entirely in a thread — no asyncio, no transports, no fd conflicts."""
+    import socket
+    import ssl
+    import time
+
+    # Step 1 — raw TCP to proxy, fully blocking
     raw_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    raw_sock.settimeout(30)  # 30s timeout
     raw_sock.connect((resolver.proxy_host, resolver.proxy_port))
 
+    # Step 2 — HTTP CONNECT
     connect_req = (
         f"CONNECT {resolver.target_host}:{resolver.target_port} HTTP/1.1\r\n"
         f"Host: {resolver.target_host}:{resolver.target_port}\r\n"
@@ -94,6 +100,7 @@ def _build_tunnel_sync(resolver):
     )
     raw_sock.sendall(connect_req.encode())
 
+    # Step 3 — Read CONNECT response
     response = b""
     while b"\r\n\r\n" not in response:
         chunk = raw_sock.recv(4096)
@@ -105,15 +112,36 @@ def _build_tunnel_sync(resolver):
         raw_sock.close()
         raise Exception(f"Proxy CONNECT failed: {response}")
 
+    # Step 4 — SSL handshake, explicitly blocking with timeout
     ssl_ctx = ssl.create_default_context()
+    ssl_ctx.check_hostname = True
+    ssl_ctx.verify_mode = ssl.CERT_REQUIRED
+
+    # KEY: keep socket blocking during handshake
+    raw_sock.setblocking(True)
+    raw_sock.settimeout(30)
+
     ssl_sock = ssl_ctx.wrap_socket(
         raw_sock,
         server_hostname=resolver.target_host,
-        do_handshake_on_connect=True
+        do_handshake_on_connect=False  # we control handshake manually
     )
-    ssl_sock.setblocking(False)
-    resolver._ssl_sock = ssl_sock  # store for iostream creation on main thread
 
+    # Step 5 — Manual handshake loop with retry on WANT_READ/WANT_WRITE
+    while True:
+        try:
+            ssl_sock.do_handshake()
+            break
+        except ssl.SSLWantReadError:
+            time.sleep(0.05)
+            continue
+        except ssl.SSLWantWriteError:
+            time.sleep(0.05)
+            continue
+
+    # Step 6 — Now switch to non-blocking for Tornado
+    ssl_sock.setblocking(False)
+    resolver._ssl_sock = ssl_sock
 
 from tornado.httpclient import HTTPRequest
 from tornado import httputil
@@ -138,11 +166,13 @@ async def _proxy_ws_connect(url, *args, **kwargs):
         target_port=parsed_target.port or 443,
     )
 
-    loop = asyncio.get_event_loop()
-    await loop.run_in_executor(None, _build_tunnel_sync, resolver)
+    # Call sync directly — no executor, no asyncio interference
+    _build_tunnel_sync(resolver)
+
+    # IOStream wraps the clean non-blocking ssl socket
     resolver._iostream = IOStream(resolver._ssl_sock)
 
-    # Rewrite wss → ws
+    # Rewrite wss → ws, Tornado skips SSL since tunnel already has it
     if isinstance(url, str):
         url = url.replace("wss://", "ws://", 1)
         request = HTTPRequest(url)
@@ -150,15 +180,8 @@ async def _proxy_ws_connect(url, *args, **kwargs):
         url.url = url.url.replace("wss://", "ws://", 1)
         request = url
 
-    # ↓ KEY FIX: ensure headers is HTTPHeaders, not dict
     request.headers = httputil.HTTPHeaders(request.headers)
-
-    # Mirror exactly what websocket_connect() does before constructing conn
-    from tornado.httpclient import _RequestProxy
-    request = cast(
-        HTTPRequest,
-        _RequestProxy(request, HTTPRequest._DEFAULTS)
-    )
+    request = _RequestProxy(request, HTTPRequest._DEFAULTS)
 
     conn = ProxiedWebSocketClientConnection(
         request,
@@ -166,8 +189,6 @@ async def _proxy_ws_connect(url, *args, **kwargs):
         **kwargs
     )
     return await conn.connect_future
-
-
 def _patched_ws_connect(url, *args, **kwargs):
     loop = asyncio.get_event_loop()
     return asyncio.ensure_future(
